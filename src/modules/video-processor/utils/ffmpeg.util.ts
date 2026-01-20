@@ -2,6 +2,7 @@ import ffmpeg from 'fluent-ffmpeg';
 import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
+import axios from 'axios';
 
 const writeFile = promisify(fs.writeFile);
 const unlink = promisify(fs.unlink);
@@ -26,7 +27,7 @@ export class FfmpegUtil {
    * Extracts a single frame from a video at a specific timestamp
    * Resizes the frame using FFmpeg scale filter (200px width, maintain aspect ratio)
    * Optimized for node-vibrant color extraction
-   * @param videoUrl - URL of the video file
+   * @param videoUrl - URL of the video file or video page (e.g., Pexels)
    * @param timestampMs - Timestamp in milliseconds
    * @returns Buffer containing the resized frame image data (JPEG format)
    */
@@ -37,10 +38,14 @@ export class FfmpegUtil {
     // Validate URL format
     if (!this.isValidVideoUrl(videoUrl)) {
       throw new Error(
-        'Invalid video URL. Please provide a direct link to a video file (e.g., .mp4, .avi, .mov). ' +
-        'Webpage URLs are not supported.'
+        'Invalid video URL. Please provide either a direct link to a video file ' +
+        '(e.g., .mp4, .avi, .mov) or a Pexels video page URL (e.g., https://www.pexels.com/video/...)'
       );
     }
+
+    // Resolve page URLs to direct video URLs
+    const resolvedUrl = await this.resolveVideoUrl(videoUrl);
+    
     await this.ensureTempDir();
 
     const timestampSeconds = timestampMs / 1000;
@@ -50,7 +55,7 @@ export class FfmpegUtil {
     );
 
     return new Promise((resolve, reject) => {
-      ffmpeg(videoUrl)
+      ffmpeg(resolvedUrl)
         .seekInput(timestampSeconds)
         .frames(1)
         .outputOptions([
@@ -89,65 +94,133 @@ export class FfmpegUtil {
   }
 
   /**
-   * Validates if URL appears to be a direct video file URL
-   * @param videoUrl - URL to validate
-   * @returns true if URL looks like a direct video file
+   * Resolves webpage URLs to direct video file URLs
+   * Currently supports Pexels video pages
+   * @param videoUrl - URL to resolve
+   * @returns Direct video URL if resolvable, otherwise returns original URL
    */
-  private static isValidVideoUrl(videoUrl: string): boolean {
+  private static async resolveVideoUrl(videoUrl: string): Promise<string> {
     const lowerUrl = videoUrl.toLowerCase();
     
-    // Check if it's a known video hosting page (not direct file)
-    // These patterns indicate HTML pages, not direct video files
-    const isVideoPage = lowerUrl.includes('/video/') && 
-                       (lowerUrl.includes('pexels.com') || 
-                        lowerUrl.includes('pixabay.com') || 
-                        lowerUrl.includes('youtube.com') ||
-                        lowerUrl.includes('vimeo.com'));
+    // Check if it's a Pexels video page
+    if (lowerUrl.includes('pexels.com') && lowerUrl.includes('/video/')) {
+      try {
+        const response = await axios.get(videoUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        });
+        const html = response.data;
+        
+        // Extract the HD or regular video URL from Pexels page
+        // Pexels typically has URLs like: src="https://cdn.pexels.com/videos/..."
+        const videoUrlMatch = html.match(/src="(https:\/\/cdn\.pexels\.com\/videos\/[^"]+\.mp4)"/);
+        if (videoUrlMatch && videoUrlMatch[1]) {
+          return videoUrlMatch[1];
+        }
+      } catch (error) {
+        console.warn(`Failed to resolve Pexels URL: ${error.message}`);
+      }
+    }
     
-    // Reject known video page URLs
-    if (isVideoPage) {
+    return videoUrl;
+  }
+
+  /**
+   * Validates if URL is a direct video file or resolvable video page
+   * Supports: direct video files, S3 URLs, CDN URLs, and known video pages
+   * @param videoUrl - URL to validate
+   * @returns true if URL is valid
+   */
+  private static isValidVideoUrl(videoUrl: string): boolean {
+    try {
+      new URL(videoUrl);
+    } catch {
       return false;
     }
     
-    // Check if URL contains video file extension
+    const lowerUrl = videoUrl.toLowerCase();
+    
+    // Allow direct video file URLs (with or without query parameters)
     const videoExtensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v'];
     const hasVideoExtension = videoExtensions.some(ext => lowerUrl.includes(ext));
+    if (hasVideoExtension) {
+      return true;
+    }
     
-    // Allow URLs with video extensions
-    // Note: Some CDN URLs might not have extensions, but we'll let FFmpeg handle those
-    return hasVideoExtension;
+    // Allow S3 URLs and other known CDN/storage URLs
+    const trustedDomains = ['s3.', 'amazonaws.com', 'cloudfront.net', 'cdn.', 'storage.googleapis.com'];
+    const isTrustedDomain = trustedDomains.some(domain => lowerUrl.includes(domain));
+    if (isTrustedDomain) {
+      return true;
+    }
+    
+    // Allow known video page URLs that we can resolve
+    const supportedPages = ['pexels.com'];
+    const isSupportedPage = supportedPages.some(domain => lowerUrl.includes(domain));
+    if (isSupportedPage && lowerUrl.includes('/video/')) {
+      return true;
+    }
+    
+    return false;
   }
 
   /**
    * Gets video duration in milliseconds
-   * @param videoUrl - URL of the video file
+   * @param videoUrl - URL of the video file or video page (e.g., Pexels)
    * @returns Duration in milliseconds
    */
   static async getVideoDuration(videoUrl: string): Promise<number> {
     // Validate URL format
     if (!this.isValidVideoUrl(videoUrl)) {
       throw new Error(
-        'Invalid video URL. Please provide a direct link to a video file (e.g., .mp4, .avi, .mov). ' +
-        'Webpage URLs (like Pexels video pages) are not supported. ' +
-        'You need to use the direct video file URL instead.'
+        'Invalid video URL. Please provide either a direct link to a video file ' +
+        '(e.g., .mp4, .avi, .mov), an S3/CDN URL, or a Pexels video page URL (e.g., https://www.pexels.com/video/...)'
       );
     }
 
+    // Resolve page URLs to direct video URLs
+    const resolvedUrl = await this.resolveVideoUrl(videoUrl);
+
     return new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(videoUrl, (err, metadata) => {
+      ffmpeg.ffprobe(resolvedUrl, (err, metadata) => {
         if (err) {
-          // Provide more helpful error message
-          let errorMessage = `Failed to probe video: ${err.message}`;
+          // Provide more helpful error message based on error type
+          let errorMessage = `Failed to process video: ${err.message}`;
+          const errMsg = err.message.toLowerCase();
           
-          if (err.message.includes('Invalid data') || err.message.includes('Invalid')) {
+          console.error(`FFprobe error for URL ${resolvedUrl}:`, err);
+          
+          // Check for specific error types
+          if (errMsg.includes('404') || errMsg.includes('not found')) {
             errorMessage = 
-              'Invalid video URL. The URL provided does not point to a valid video file. ' +
-              'Please ensure you are using a direct link to a video file (e.g., .mp4, .avi, .mov), ' +
-              'not a webpage URL. Example: https://example.com/video.mp4';
-          } else if (err.message.includes('HTTP error') || err.message.includes('404')) {
+              'Video file not found (404). The video file does not exist at the provided URL. ' +
+              'Please verify the URL is correct and the file exists.';
+          } else if (errMsg.includes('403') || errMsg.includes('forbidden') || errMsg.includes('unauthorized')) {
             errorMessage = 
-              'Video URL not accessible. The video file could not be found or accessed. ' +
-              'Please check that the URL is correct and publicly accessible.';
+              'Access denied to video URL (403/401). The file exists but requires authentication or is not publicly accessible. ' +
+              'Please ensure you have the proper access rights or use a publicly accessible URL.';
+          } else if (errMsg.includes('connection') || errMsg.includes('timeout') || errMsg.includes('econnrefused')) {
+            errorMessage = 
+              'Cannot connect to video URL. The server is unreachable or the connection timed out. ' +
+              'Please verify the URL is accessible and check your network connection.';
+          } else if (errMsg.includes('invalid') && (errMsg.includes('format') || errMsg.includes('stream'))) {
+            errorMessage = 
+              'Invalid video format or corrupted file. The URL points to a file that is not a valid video. ' +
+              'Please ensure the URL is a direct link to a valid video file (e.g., .mp4, .avi, .mov).';
+          } else if (errMsg.includes('no such file') || errMsg.includes('does not exist')) {
+            errorMessage = 
+              'Video URL is not accessible or does not exist. ' +
+              'Please verify the URL is correct, publicly accessible, and points to a valid video file.';
+          } else if (errMsg.includes('moov atom not found') || errMsg.includes('invalid data found')) {
+            errorMessage = 
+              'Invalid MP4 file or corrupted video. The video file is missing critical metadata (MOOV atom). ' +
+              'This usually means: (1) the file is corrupted, (2) the file was not fully uploaded, or (3) the file structure is incompatible with streaming. ' +
+              'Try downloading and re-encoding the video locally, or ensure the file is fully uploaded and valid.';
+          } else if (errMsg.includes('protocol') || errMsg.includes('unknown')) {
+            errorMessage = 
+              'Unable to access video URL. This could be due to network issues, redirects, or CORS restrictions. ' +
+              'Please ensure the URL is a direct link to a publicly accessible video file.';
           }
           
           reject(new Error(errorMessage));
@@ -156,7 +229,7 @@ export class FfmpegUtil {
 
         const durationSeconds = metadata.format.duration;
         if (!durationSeconds) {
-          reject(new Error('Could not determine video duration'));
+          reject(new Error('Could not determine video duration from the file'));
           return;
         }
 

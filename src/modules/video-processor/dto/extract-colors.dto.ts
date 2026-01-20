@@ -3,8 +3,8 @@ import { IsArray, IsNumber, IsString, IsUrl, Min } from 'class-validator';
 
 export class ExtractColorsDto {
   @ApiProperty({
-    description: 'URL of the video file to process',
-    example: 'https://example.com/video.mp4',
+    description: 'URL of the video file or video page (e.g., Pexels video page)',
+    example: 'https://www.pexels.com/video/... or https://example.com/video.mp4',
   })
   @IsString()
   @IsUrl({}, { message: 'videoUrl must be a valid URL' })
